@@ -487,6 +487,31 @@ function DILineInfoPrinter(linetable::Vector, showtypes::Bool=false)
     return emit_lineinfo_update
 end
 
+# line_info_preprinter(io::IO, indent::String, idx::Int) may print relevant info
+#   at the beginning of the line, and should at least print `indent`. It returns a
+#   string that will be printed after the final basic-block annotation.
+# line_info_postprinter(io::IO, typ, used::Bool) prints the type-annotation at the end
+#   of the statement
+# pop_new_node!(idx::Int) -> (node_idx, new_node_inst, new_node_type) may return a new
+#   node at the current index `idx`, which is printed before the statement at index
+#   `idx`. This function is repeatedly called until it returns `nothing`
+# should_print_stmt(idx::Int) -> Bool: whether the statement at index `idx` should be
+#   printed as part of the IR or not
+# bb_color: color used for printing the basic block brackets on the left
+struct IRShowConfig
+    line_info_preprinter
+    line_info_postprinter
+    pop_new_node!
+    should_print_stmt
+    bb_color::Symbol
+    function IRShowConfig(line_info_preprinter, line_info_postprinter=default_expr_type_printer;
+                          pop_new_node! = Returns(nothing), should_print_stmt=Returns(true),
+                          bb_color::Symbol=:light_black)
+        return new(line_info_preprinter, line_info_postprinter, pop_new_node!,
+                   should_print_stmt, bb_color)
+    end
+end
+
 struct _UNDEF
     global const UNDEF = _UNDEF.instance
 end
@@ -529,16 +554,14 @@ end
 
 # Show a single statement, code.stmts[idx]/code.code[idx], in the context of the whole IRCode/CodeInfo.
 # Returns the updated value of bb_idx.
-# line_info_preprinter(io::IO, indent::String, idx::Int) may print relevant info
-#   at the beginning of the line, and should at least print `indent`. It returns a
-#   string that will be printed after the final basic-block annotation.
-# line_info_postprinter(io::IO, typ, used::Bool) prints the type-annotation at the end
-#   of the statement
-# pop_new_node!(idx::Int) -> (node_idx, new_node_inst, new_node_type) may return a new
-#   node at the current index `idx`, which is printed before the statement at index
-#   `idx`. This function is repeatedly called until it returns `nothing`
+function show_ir_stmt(io::IO, code::Union{IRCode, CodeInfo}, idx::Int, config::IRShowConfig,
+                      used::BitSet, cfg::CFG, bb_idx::Int)
+    return show_ir_stmt(io, code, idx, config.line_info_preprinter, config.line_info_postprinter,
+                        used, cfg, bb_idx, config.pop_new_node!; config.bb_color)
+end
+
 function show_ir_stmt(io::IO, code::Union{IRCode, CodeInfo}, idx::Int, line_info_preprinter, line_info_postprinter,
-                      used::BitSet, cfg::CFG, bb_idx::Int, pop_new_node! = _ -> nothing; bb_color=:light_black)
+                      used::BitSet, cfg::CFG, bb_idx::Int, pop_new_node! = Returns(nothing); bb_color=:light_black)
     stmt = _stmt(code, idx)
     type = _type(code, idx)
     max_bb_idx_size = length(string(length(cfg.blocks)))
@@ -693,10 +716,11 @@ end
 _strip_color(s::String) = replace(s, r"\e\[\d+m" => "")
 
 # corresponds to `verbose_linetable=true`
-function ircode_verbose_linfo_printer(code::IRCode, used::BitSet)
+function ircode_verbose_linfo_printer(code::IRCode)
     stmts = code.stmts
     max_depth = maximum(compute_inlining_depth(code.linetable, stmts[i][:line]) for i in 1:length(stmts.line))
     last_stack = Ref(Int[])
+    used = stmts_used(code, false)
     maxlength_idx = if isempty(used)
         0
     else
@@ -733,16 +757,27 @@ function ircode_verbose_linfo_printer(code::IRCode, used::BitSet)
     end
 end
 
-function show_ir(io::IO, code::IRCode, expr_type_printer=default_expr_type_printer; verbose_linetable=false)
+function statementidx_lineinfo_printer(f, code::IRCode)
+    printer = f(code.linetable)
+    function (io::IO, indent::String, idx::Int)
+        printer(io, indent, idx > 0 ? code.stmts[idx][:line] : typemin(Int32))
+    end
+end
+function statementidx_lineinfo_printer(f, code::CodeInfo)
+    printer = f(code.linetable)
+    function (io::IO, indent::String, idx::Int)
+        printer(io, indent, idx > 0 ? code.codelocs[idx] : typemin(Int32))
+    end
+end
+statementidx_lineinfo_printer(code) = statementidx_lineinfo_printer(DILineInfoPrinter, code)
+
+function stmts_used(code::IRCode, warn_unset_entry=true)
     stmts = code.stmts
-    isempty(stmts) && return # unlikely, but avoid errors from reducing over empty sets
     used = BitSet()
-    cfg = code.cfg
     for stmt in stmts
         scan_ssa_use!(push!, used, stmt[:inst])
     end
     new_nodes = code.new_nodes.stmts
-    warn_unset_entry = true
     for nn in 1:length(new_nodes)
         if isassigned(new_nodes.inst, nn)
             scan_ssa_use!(push!, used, new_nodes[nn][:inst])
@@ -751,44 +786,42 @@ function show_ir(io::IO, code::IRCode, expr_type_printer=default_expr_type_print
             warn_unset_entry = false
         end
     end
-    bb_idx = 1
-
-    pop_new_node! = ircode_new_nodes_iter(code)
-
-    if verbose_linetable
-        line_info_preprinter = ircode_verbose_linfo_printer(code, used)
-    else
-        line_info_preprinter = ircode_default_linfo_printer(code)
-    end
-
-    for idx in 1:length(stmts)
-        bb_idx = show_ir_stmt(io, code, idx, line_info_preprinter, expr_type_printer,
-                              used, cfg, bb_idx, pop_new_node!; bb_color=:normal)
-    end
-    nothing
+    return used
 end
 
-function statementidx_lineinfo_printer(f, code::CodeInfo)
-    printer = f(code.linetable)
-    return (io::IO, indent::String, idx::Int) -> printer(io, indent, idx > 0 ? code.codelocs[idx] : typemin(Int32))
-end
-statementidx_lineinfo_printer(code::CodeInfo) = statementidx_lineinfo_printer(DILineInfoPrinter, code)
-
-function show_ir(io::IO, code::CodeInfo, line_info_preprinter=statementidx_lineinfo_printer(code), line_info_postprinter=default_expr_type_printer)
+function stmts_used(code::CodeInfo)
     stmts = code.code
     used = BitSet()
-    cfg = compute_basic_blocks(stmts)
     for stmt in stmts
         scan_ssa_use!(push!, used, stmt)
     end
+    return used
+end
+
+function default_config(code::IRCode; verbose_linetable=false)
+    return IRShowConfig(verbose_linetable ? ircode_verbose_linfo_printer(code)
+                                          : ircode_default_linfo_printer(code);
+                        pop_new_node! = ircode_new_nodes_iter(code),
+                        bb_color=:normal)
+end
+default_config(code::CodeInfo) = IRShowConfig(statementidx_lineinfo_printer(code))
+
+function show_ir(io::IO, code::Union{IRCode, CodeInfo}, config::IRShowConfig=default_config(code))
+    stmts = code isa IRCode ? code.stmts : code.code
+    used = stmts_used(code)
+    cfg = code isa IRCode ? code.cfg : compute_basic_blocks(stmts)
     bb_idx = 1
 
     for idx in 1:length(stmts)
-        bb_idx = show_ir_stmt(io, code, idx, line_info_preprinter, line_info_postprinter, used, cfg, bb_idx)
+        if config.should_print_stmt(code, idx, used)
+            bb_idx = show_ir_stmt(io, code, idx, config, used, cfg, bb_idx)
+        elseif bb_idx <= length(cfg.blocks) && idx == cfg.blocks[bb_idx].stmts.stop
+            bb_idx += 1
+        end
     end
 
     max_bb_idx_size = length(string(length(cfg.blocks)))
-    line_info_preprinter(io, " "^(max_bb_idx_size + 2), 0)
+    config.line_info_preprinter(io, " "^(max_bb_idx_size + 2), 0)
     nothing
 end
 
